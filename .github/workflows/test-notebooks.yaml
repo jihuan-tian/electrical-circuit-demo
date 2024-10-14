@@ -1,0 +1,131 @@
+name: Test
+run-name: 👷 Testing all reactive notebooks
+on: [pull_request]
+env:
+  JOLIN_SITE: "nosite.nosite"
+  JOLIN_ENVIRONMENT: "test"
+  JOLINPLUTOCICD_VERSION: "0.1.19"
+defaults:
+  run:
+    shell: bash  # we want to use bash as the default shell
+jobs:
+  job-matrix:
+    runs-on: ubuntu-latest
+    container: jolincompany/jolin_cloud_cicd:latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: List all notebooks.
+        id: set-matrix
+        run: |
+          echo matrix=$(julia -e '
+            import Pkg
+            Pkg.Registry.add("General")
+            Pkg.Registry.add(Pkg.RegistrySpec(url="https://github.com/jolin-io/JolinRegistry.jl"))
+            Pkg.add(name="JolinPlutoCICD", version=ENV["JOLINPLUTOCICD_VERSION"])
+            using JolinPlutoCICD
+            print(JolinPlutoCICD.json_common_prefix_common_suffix_and_all_notebook_paths(ARGS[1]))
+          ' .) >> "$GITHUB_OUTPUT"
+
+  job-run:
+    name: ${{ matrix.notebook_path }}
+    runs-on: ubuntu-latest
+    container: jolincompany/jolin_cloud_cicd:latest
+    needs: job-matrix
+    strategy:
+      matrix: ${{ fromJSON(needs.job-matrix.outputs.matrix) }}
+    permissions:
+      id-token: write  # This is required for requesting the JWT
+      contents: read  # This is required for actions/checkout
+    steps:
+    - uses: actions/checkout@v3
+
+    # set JOLIN_REPO environment variable
+    - name: Set environment variable "JOLIN_REPO".
+      run: echo "JOLIN_REPO=github.com/${GITHUB_REPOSITORY#*/}" >> $GITHUB_ENV
+
+    - name: Add julia registries and JolinPlutoCICD (our cicd helper).
+      run: |
+        julia -e '
+          import Pkg
+          Pkg.Registry.add("General")
+          Pkg.Registry.add(Pkg.RegistrySpec(url="https://github.com/jolin-io/JolinRegistry.jl"))
+          # Pkg.Registry.update() # not needed because the registries are added the first time
+          Pkg.add("JolinPlutoCICD")
+        '
+
+    # we need to create temporary environment under GITHUB_WORKSPACE, because only files under this directory can be hashed
+    # see https://docs.github.com/en/actions/learn-github-actions/expressions#hashfiles
+    - name: Setup julia project environment for the notebook and export the directory to environment variable "notebook_env".
+      run: |
+        echo notebook_env=$(julia -e '
+          using JolinPlutoCICD
+          env_dir = JolinPlutoCICD.create_pluto_env(ARGS[1], parentdir=joinpath(ENV["GITHUB_WORKSPACE"], "_temp_envs"))
+
+          # we want to cache .CondaPkg, hence it already needs to exist
+          mkpath(joinpath(env_dir, ".CondaPkg"))
+
+          # we need to strip the GITHUB_WORKSPACE because hashFiles only works with paths relative to GITHUB_WORKSPACE
+          # Char(47) == "/" (as char, but we cannot easily use single quotes here)
+          env_dir_relative = lstrip(env_dir[begin+length(ENV["GITHUB_WORKSPACE"]) : end], Char(47))
+          print(env_dir_relative)
+        ' "${{ matrix.prefix }}${{ matrix.notebook_path }}${{ matrix.suffix }}") >> "$GITHUB_ENV"
+
+    # fixing permission error for hashfiles (actually works)
+    # adapted from https://github.com/cypress-io/github-action/issues/446#issuecomment-968192021
+    - name: Fix caching.
+      run: chown -R 1001:1001 $GITHUB_WORKSPACE/$notebook_env
+
+    - name: Apply caching.
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.julia
+          $GITHUB_WORKSPACE/$notebook_env/.CondaPkg
+        key: ${{ runner.os }}-${{ hashFiles(format('{0}/*.toml', env.notebook_env)) }}
+        restore-keys: ${{ runner.os }}-
+
+    - name: Conda instantiate (i.e. download and install conda packages).
+      run: |
+        # initialize conda first, because RCall cannot be build without R_HOME being set (pseudo R_HOME also do not work)
+        # we cannot do this inside the notebook_env because adding JolinPlutoCICD would already trigger a build of RCall if it is there in the Manifest.toml
+        julia -e '
+          # because of the caching we need to reinstall JolinPlutoCICD
+          # (alternatively we could merge old and new .julia folder)
+          import Pkg
+          Pkg.Registry.add("General")
+          Pkg.Registry.add(Pkg.RegistrySpec(url="https://github.com/jolin-io/JolinRegistry.jl"))
+          Pkg.Registry.update()  # needed because registries might already exist with outdated information
+          Pkg.add(name="JolinPlutoCICD", version=ENV["JOLINPLUTOCICD_VERSION"])
+
+          import JolinPlutoCICD
+          eval(JolinPlutoCICD.expr_resolve_condapkg(ARGS[1]))
+        ' "$GITHUB_WORKSPACE/$notebook_env"
+
+        # set R_HOME if conda was actually initialized - needed before Pkg.instantiate()
+        if [ -d "$GITHUB_WORKSPACE/$notebook_env/.CondaPkg" ]; then
+          echo R_HOME="$GITHUB_WORKSPACE/$notebook_env/.CondaPkg/env/lib/R" >> "$GITHUB_ENV"
+        fi
+
+    - name: Julia instantiate (i.e. download and install julia packages).
+      run: |
+        # this will build RCall if it is a dependency and will fail if R_HOME is not correct
+        # this is why conda packages are instantiated before julia packages
+        julia --project="$GITHUB_WORKSPACE/$notebook_env" -e '
+          import Pkg
+          Pkg.instantiate()
+        '
+
+    - name: Run notebook.
+      working-directory: ./
+      run: |
+        FILE="${{ matrix.prefix }}${{ matrix.notebook_path }}${{ matrix.suffix }}"
+        if [[ "$FILE" == *.jl ]]; then
+          JULIA_PROJECT="$GITHUB_WORKSPACE/$notebook_env" julia "$FILE"
+        elif [[ "$FILE" == *.py ]]; then
+          # special env because of https://github.com/JuliaPy/PythonCall.jl/issues/426
+          PYTHON_JULIAPKG_OFFLINE=yes PYTHON_JULIAPKG_PROJECT="$GITHUB_WORKSPACE/$notebook_env" "$GITHUB_WORKSPACE/$notebook_env/.CondaPkg/env/bin/python" "$FILE"
+        elif [[ "$FILE" == *.R ]] || [[ "$FILE" == *.r ]]; then
+          JULIA_PROJECT="$GITHUB_WORKSPACE/$notebook_env" "$GITHUB_WORKSPACE/$notebook_env/.CondaPkg/env/bin/Rscript" "$FILE"
+        fi
